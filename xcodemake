@@ -11,7 +11,8 @@
 # this could be rewritten in python and use ninja instead.
 #
 # xcodebuild re-run if its arguments change or make fails or project modified.
-# Makefile re-generated if script modified or xcodebuild recaptured.
+# Makefile re-generated if script newer or different xcodebuild or arguments)
+# Use the potentially modified $variant string for the grep check
 #
 
 use IO::File;
@@ -33,7 +34,7 @@ sub unescape {
 # escape literal '$' for make --> '$$'
 sub dollarEscape {
     # $_[0] is the variable passed by reference implicitly
-    $_[0] =~ s/\$/\$\$/g;
+    $_[0] =~ s/\$/\\$$/g;
 }
 # escape characters sensitive to the shell/make for file paths
 sub shellEscape {
@@ -43,15 +44,24 @@ sub shellEscape {
     $_[0] =~ s/ /\\ /g;
 }
 
+# specifically for Make dependencies/targets
+sub makeEscape {
+    my $path = $_[0];
+    $path =~ s/ /\\ /g;
+    return $path;
+}
+
 # --- Global Variables ---
-my $log = "xcodemake @original_ARGV.log";
+my $safe_args = "@original_ARGV";
+$safe_args =~ s/[^a-zA-Z0-9]/_/g;
+my $log = "xcodemake_$safe_args.log";
 my $make = "Makefile";
 
 my $xcodebuild = ($ENV{DEVELOPER_BIN_DIR}||'/usr/bin')."/xcodebuild";
 my $archs = $ENV{ARCHS}||'arm64';
 # Define $args based on original_ARGV, but check *original_ARGV* for -config
 my $args_for_variant = join ' ', map { "'$_'" } @original_ARGV;
-my $has_config_in_original = grep { /^-config$/ } @original_ARGV;
+my $has_config_in_original = grep { /^-config$/ || /^-configuration$/ } @original_ARGV;
 $args_for_variant .= " -config Debug" unless $has_config_in_original;
 
 my $variant = "$xcodebuild ARCHS=$archs @original_ARGV";
@@ -64,7 +74,7 @@ my ($LOG, $fileArg); # $LOG will be lexical to generateMakefile
 
 # regex for file path argument (handles spaces escaped with backslash)
 my $notSpace = "[^\\\\\\s]";
-$fileArg = "$notSpace+(?:\\\\.$notSpace*)*";
+$fileArg = "$notSpace+(?:\\.$notSpace*)*";
 
 # --- Main Logic ---
 
@@ -125,7 +135,7 @@ sub captureXcodebuild {
     # Use the potentially modified $variant string for matching here
     if (my ($bundle) = $variant =~ /-resultBundlePath ($fileArg)/) {
         my $rm_bundle = $bundle;
-        unescape("'\\\\'", $rm_bundle);
+        unescape("'\\\'", $rm_bundle);
         $rm_cmd = ['rm', '-rf', $rm_bundle];
     }
 
@@ -155,7 +165,7 @@ sub captureXcodebuild {
         my $clean_raw_status = $?;
         my $clean_exit_code  = $clean_raw_status >> 8;
         my $clean_signal     = $clean_raw_status & 0x7F;
-        warn "Error: xcodebuild clean failed: exit code=$clean_exit_code, signal=$clean_signal, raw(\$?)=$clean_raw_status\n";
+        warn "Error: xcodebuild clean failed: exit code=$clean_exit_code, signal=$clean_signal, raw(\"?)=$clean_raw_status\n";
         rename $builddb.".save", $builddb if -f $builddb.".save";
         exit !$EXIT_SUCCESS; # Exit with a non-zero status
     }
@@ -169,10 +179,10 @@ sub captureXcodebuild {
     {
         # Set environment locally for the fork/exec done by open()
         local $ENV{ARCHS} = $child_env{ARCHS};
-        $build_pid = open($build_fh, "-|", @build_cmd);
+        $build_pid = open($build_fh, "-| ", @build_cmd);
     }
     unless (defined $build_pid) { # Check if open succeeded
-         warn "Error: Cannot fork for xcodebuild: $!";
+         warn "Error: Cannot fork for xcodebuild: $!\n";
          rename $builddb.".save", $builddb if -f $builddb.".save";
          exit !$EXIT_SUCCESS; # Exit with a non-zero status
     }
@@ -180,7 +190,7 @@ sub captureXcodebuild {
     # Open log file for writing
     my $log_fh;
     unless (open $log_fh, ">", $log) {
-        warn "Error: Cannot open log file $log for writing: $!";
+        warn "Error: Cannot open log file $log for writing: $!\n";
          # Need to ensure we don't leave the child process running
          eval { close($build_fh); }; # Try to close the pipe
          waitpid($build_pid, 0) if $build_pid > 0; # Wait if pid is valid
@@ -203,7 +213,7 @@ sub captureXcodebuild {
          my $build_status = $?;
          my $build_exit_code = $build_status >> 8;
          my $build_signal    = $build_status & 0x7F;
-         warn "Error: xcodebuild build command failed (detected by close pipe): exit code=$build_exit_code, signal=$build_signal, raw(\$?)=$build_status\n";
+         warn "Error: xcodebuild build command failed (detected by close pipe): exit code=$build_exit_code, signal=$build_signal, raw(\"?)=$build_status\n";
          unlink $log if -f $log; # Remove potentially incomplete log
          rename $builddb.".save", $builddb if -f $builddb.".save";
          exit !$EXIT_SUCCESS; # Exit with a non-zero status
@@ -217,7 +227,7 @@ sub captureXcodebuild {
 
     # Explicitly check for exit code 0 and no signal for success
     if ($build_exit_code != $EXIT_SUCCESS || $build_signal != 0) {
-        warn "Error: xcodebuild build command finished but indicated failure: exit code=$build_exit_code, signal=$build_signal, raw(\$?)=$build_status\n";
+        warn "Error: xcodebuild build command finished but indicated failure: exit code=$build_exit_code, signal=$build_signal, raw(\"?)=$build_status\n";
         unlink $log if -f $log; # Remove potentially incomplete log
         rename $builddb.".save", $builddb if -f $builddb.".save";
         exit !$EXIT_SUCCESS; # Exit with a non-zero status
@@ -234,11 +244,11 @@ sub generateMakefile {
     # Use lexical filehandle for safety
     my $log_fh;
     unless (open $log_fh, "<", $log) {
-        die "Could not open $log: $!";
+        die "Could not open $log: $!\n";
     }
     my $make_fh;
      unless (open $make_fh, ">", $make) {
-        die "Could not create $make: $!";
+        die "Could not create $make: $!\n";
     }
 
     # Get next line from log
@@ -259,7 +269,8 @@ sub generateMakefile {
         # Handle potential '/usr/bin/time' prefix added by the script itself if re-parsing
         $line =~ s{^\s*/usr/bin/time\s+}{};
         my $cd = $line;
-        unescape("^\$'()&", $cd);
+        unescape("'^\$'()&", $cd);
+        # Escape for shell execution within Makefile
         escape(" ", $cd);
         dollarEscape($cd);
         return "\t\tcd $cd\n\t\t"; # Just return the cd line and tabs
@@ -273,7 +284,7 @@ sub generateMakefile {
         my @values = $line =~ m/ $option\s+($fileArg)/g;
         # Unescape paths extracted via regex
         for (@values) {
-             unescape("'\\\\'", $_);
+             unescape("'\\\'", $_);
         }
         return @values;
     };
@@ -296,7 +307,7 @@ HEADER
         print $make_fh "# $line\n";
 
         # --- CompileC Handling (Objective-C/C/C++) ---
-        if (my ($object, $source) = $line =~
+        if (my ($object, $source) = $line =~ 
             /^CompileC ($fileArg) ($fileArg) /) {
             my $cd = &$nextCD();
             unless (defined $cd) {
@@ -315,10 +326,10 @@ HEADER
             }
 
             # Prepare paths for Make rule
-            my $make_target_object = $object;
-            my $make_dep_source = $source;
+            my $make_target_object = makeEscape($object);
+            my $make_dep_source = makeEscape($source);
             unescape("{}()", $make_target_object);
-            escape("\$& ", $make_target_object);
+            escape("\$&", $make_target_object);
             dollarEscape($make_dep_source);
             unescape("'", $make_dep_source);
 
@@ -370,13 +381,13 @@ HEADER
                 warn "Warning: Could not find -output-file-map in SwiftDriver line: $build_invocation_line\nSkipping Swift rules.\n";
                 next;
             }
-            unescape("'\\\\'", $output_map_file);
+            unescape("'\\\'", $output_map_file);
 
             # Read and parse the JSON Output File Map
             my $map_content;
             my $MAP_FH;
             eval {
-                $MAP_FH = IO::File->new("< $output_map_file") or die "Cannot open output map $output_map_file: $!";
+                $MAP_FH = IO::File->new("< $output_map_file") or die "Cannot open output map $output_map_file: $!\n";
                 local $/; # Slurp mode
                 $map_content = <$MAP_FH>;
                 close $MAP_FH;
@@ -407,10 +418,10 @@ HEADER
                 my $object = $output_map->{$source}{object};
 
                 # Prepare paths for Make rule
-                my $make_target_object = $object;
-                my $make_dep_source = $source;
+                my $make_target_object = makeEscape($object);
+                my $make_dep_source = makeEscape($source);
                 unescape("{}()", $make_target_object);
-                escape("\$& ", $make_target_object);
+                escape("\$&", $make_target_object);
                 dollarEscape($make_dep_source);
                 unescape("'", $make_dep_source);
 
@@ -455,10 +466,10 @@ HEADER
 
             foreach my $i (0..$#sources) {
                  # Prepare paths for Make rule
-                my $make_target_object = $objects[$i];
-                my $make_dep_source = $sources[$i];
+                my $make_target_object = makeEscape($objects[$i]);
+                my $make_dep_source = makeEscape($sources[$i]);
                 unescape("{}()", $make_target_object);
-                escape("\$& ", $make_target_object);
+                escape("\$&", $make_target_object);
                 dollarEscape($make_dep_source);
                 unescape("'", $make_dep_source);
 
@@ -492,9 +503,9 @@ HEADER
             my ($linkfile) = $link_cmd_line =~ /(?<!-Xlinker)\s-filelist\s+($fileArg)/;
 
             # Prepare executable path for Make target
-            my $make_target_executable = $executable;
+            my $make_target_executable = makeEscape($executable);
             unescape("{}()", $make_target_executable);
-            escape("\$& ", $make_target_executable);
+            escape("\$&", $make_target_executable);
 
             # Prepare link command for recipe
             my $make_link_cmd_line = $link_cmd_line;
@@ -506,12 +517,12 @@ HEADER
             unless (defined $linkfile) {
                  warn "Warning: Could not find -filelist in link command for $executable: $link_cmd_line\nLinking without specific object dependencies.\n";
             } else {
-                 unescape("'\\\\'", $linkfile);
-                 print "Link file for $executable: $linkfile\n";
+                 unescape("'\\\'", $linkfile);
+                 warn "Link file for $executable: $linkfile\n";
 
                  my $OBJS_FH;
                  eval {
-                     $OBJS_FH = IO::File->new("< $linkfile") or die "Cannot open link file list $linkfile: $!";
+                     $OBJS_FH = IO::File->new("< $linkfile") or die "Cannot open link file list $linkfile: $!\n";
                  };
                  unless (defined $OBJS_FH) {
                      warn "Warning: Could not open link file list $linkfile for $executable: $@. Linking without specific object dependencies.\n";
@@ -521,25 +532,19 @@ HEADER
                         chomp $object;
 
                         # Create the canonical, Make-escaped version for hash lookup
-                        my $canonical_object = $object;
+                        my $canonical_object = makeEscape($object);
                         unescape("{}()", $canonical_object);
-                        escape("\$& ", $canonical_object);
+                        escape("\$&", $canonical_object);
 
                         if ($rules{$canonical_object}) { # Check if we know how to build this object
                             # Escape object path for dependency list (spaces are separators)
-                            my $dep_object = $object;
-                            $dep_object =~ s/ /\\ /g;
-                            escape("'", $dep_object);
-                            print $make_fh " $dep_object";
+                            print $make_fh " $canonical_object";
                         } else {
                             # Also check if it's a module object file that might have a rule
                             # Some objects might not be in %rules if they're from packages
                             if ($object =~ /\.o$/) {
                                 # Escape object path for dependency list anyway
-                                my $dep_object = $object;
-                                $dep_object =~ s/ /\\ /g;
-                                escape("'", $dep_object);
-                                print $make_fh " $dep_object";
+                                print $make_fh " $canonical_object";
                             }
                             # Optional: Warn about objects in link list not generated by known rules?
                             # warn "Object $object listed in $linkfile but no rule found to build it.";
